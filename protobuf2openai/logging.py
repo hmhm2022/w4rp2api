@@ -1,32 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Local logging for protobuf2openai package to avoid cross-package dependencies.
+统一的日志配置 - protobuf2openai模块
+使用统一日志管理系统
 """
-import logging
-from logging.handlers import RotatingFileHandler
-from pathlib import Path
 
-LOG_DIR = Path("logs")
-LOG_DIR.mkdir(exist_ok=True)
+# 使用统一日志管理器
+import sys
+import os
 
-_logger = logging.getLogger("protobuf2openai")
-_logger.setLevel(logging.INFO)
+# 导入父目录的统一日志系统
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+from warp2protobuf.core.unified_logging import LoggerManager
 
-# Remove existing handlers to prevent duplication
-for h in _logger.handlers[:]:
-    _logger.removeHandler(h)
-
-file_handler = RotatingFileHandler(LOG_DIR / "openai_compat.log", maxBytes=5*1024*1024, backupCount=3, encoding="utf-8")
-file_handler.setLevel(logging.INFO)
-console_handler = logging.StreamHandler()
-console_handler.setLevel(logging.INFO)
-
-fmt = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s')
-file_handler.setFormatter(fmt)
-console_handler.setFormatter(fmt)
-
-_logger.addHandler(file_handler)
-_logger.addHandler(console_handler)
-
-logger = _logger 
+# 使用统一管理的logger
+logger = LoggerManager.get_logger('protobuf2openai', 'openai_compat.log')

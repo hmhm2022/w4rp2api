@@ -9,9 +9,12 @@ from .logging import logger
 
 from .config import BRIDGE_BASE_URL
 from .helpers import _get
+from .warp_response_handler import WarpResponseHandler, ContextAwarePromptGenerator
 
 
 async def stream_openai_sse(packet: Dict[str, Any], completion_id: str, created_ts: int, model_id: str) -> AsyncGenerator[str, None]:
+    # 初始化响应处理器
+    response_handler = WarpResponseHandler()
     try:
         first = {
             "id": completion_id,
@@ -85,6 +88,19 @@ async def stream_openai_sse(packet: Dict[str, Any], completion_id: str, created_
                                     logger.info("[OpenAI Compat] 接收到的 Protobuf 事件(parsed): %s", json.dumps(event_data, ensure_ascii=False))
                                 except Exception:
                                     pass
+
+                                # 使用响应处理器检测和处理事件
+                                handled_event = response_handler.handle_sse_event(event_data)
+                                if handled_event != event_data:
+                                    # 如果处理器返回了不同的事件（重试或兜底响应）
+                                    if "choices" in handled_event:
+                                        # 直接输出处理器生成的响应
+                                        try:
+                                            logger.info("[OpenAI Compat] 响应处理器生成的 SSE: %s", json.dumps(handled_event, ensure_ascii=False))
+                                        except Exception:
+                                            pass
+                                        yield f"data: {json.dumps(handled_event, ensure_ascii=False)}\n\n"
+                                        continue
 
                                 if "init" in event_data:
                                     pass
@@ -225,6 +241,19 @@ async def stream_openai_sse(packet: Dict[str, Any], completion_id: str, created_
                             logger.info("[OpenAI Compat] 接收到的 Protobuf 事件(parsed): %s", json.dumps(event_data, ensure_ascii=False))
                         except Exception:
                             pass
+
+                        # 使用响应处理器检测和处理事件（第二处理循环）
+                        handled_event = response_handler.handle_sse_event(event_data)
+                        if handled_event != event_data:
+                            # 如果处理器返回了不同的事件（重试或兜底响应）
+                            if "choices" in handled_event:
+                                # 直接输出处理器生成的响应
+                                try:
+                                    logger.info("[OpenAI Compat] 响应处理器生成的 SSE (retry loop): %s", json.dumps(handled_event, ensure_ascii=False))
+                                except Exception:
+                                    pass
+                                yield f"data: {json.dumps(handled_event, ensure_ascii=False)}\n\n"
+                                continue
 
                         if "init" in event_data:
                             pass
