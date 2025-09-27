@@ -102,25 +102,45 @@ def map_history_to_warp_messages(history: List[ChatMessage], task_id: str, syste
     return msgs
 
 
-def attach_user_and_tools_to_inputs(packet: Dict[str, Any], history: List[ChatMessage], system_prompt_text: Optional[str]) -> None:
+def attach_user_and_tools_to_inputs(packet: Dict[str, Any], history: List[ChatMessage], system_prompt_text: Optional[str], system_prompt_mode: str = "merge", original_referenced_attachments: Optional[Dict[str, Any]] = None) -> None:
     # Use the final post-reorder message as input (user or tool result)
     if not history:
         assert False, "post-reorder 必须至少包含一条消息"
     last = history[-1]
     if last.role == "user":
         user_query_payload: Dict[str, Any] = {"query": segments_to_text(normalize_content_to_list(last.content))}
-        if system_prompt_text:
-            user_query_payload["referenced_attachments"] = {
-                "SYSTEM_PROMPT": {
-                    "plain_text": f"""<ALERT>you are not allowed to call following tools:  - `read_files`
-- `write_files`
-- `run_commands`
-- `list_files`
-- `str_replace_editor`
-- `ask_followup_question`
-- `attempt_completion`</ALERT>{system_prompt_text}"""
+
+        # 处理 referenced_attachments
+        # 注意：由于我们在 OpenAI 兼容层，客户端的 referenced_attachments
+        # 实际上是在后续的 Protobuf 处理中被添加的，这里我们需要特殊处理
+
+        if system_prompt_mode == "replace":
+            # 替换模式：只使用环境变量的 SYSTEM_PROMPT，完全忽略客户端的 SYSTEM_PROMPT
+            if system_prompt_text:
+                user_query_payload["referenced_attachments"] = {
+                    "SYSTEM_PROMPT": {
+                        "plain_text": system_prompt_text
                     }
                 }
+                # 在替换模式下，我们不保留客户端的任何 SYSTEM_PROMPT 相关内容
+                # 但保留其他类型的 referenced_attachments（如果有的话）
+                if original_referenced_attachments:
+                    for key, value in original_referenced_attachments.items():
+                        if key != "SYSTEM_PROMPT":
+                            user_query_payload["referenced_attachments"][key] = value
+        else:
+            # 合并模式：环境变量优先，但保留客户端的其他 referenced_attachments
+            if original_referenced_attachments:
+                user_query_payload["referenced_attachments"] = original_referenced_attachments.copy()
+
+            # 环境变量的 SYSTEM_PROMPT 会覆盖客户端的 SYSTEM_PROMPT
+            if system_prompt_text:
+                if "referenced_attachments" not in user_query_payload:
+                    user_query_payload["referenced_attachments"] = {}
+                user_query_payload["referenced_attachments"]["SYSTEM_PROMPT"] = {
+                    "plain_text": system_prompt_text
+                }
+
         packet["input"]["user_inputs"]["inputs"].append({"user_query": user_query_payload})
         return
     if last.role == "tool" and last.tool_call_id:
@@ -134,4 +154,4 @@ def attach_user_and_tools_to_inputs(packet: Dict[str, Any], history: List[ChatMe
         })
         return
     # If neither, assert to catch protocol violations
-    assert False, "post-reorder 最后一条必须是 user 或 tool 结果" 
+    assert False, "post-reorder 最后一条必须是 user 或 tool 结果"

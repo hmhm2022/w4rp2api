@@ -13,10 +13,11 @@ async def main():
     await startup_tasks()
     
     # 启动 warp server 的后台线程
+    warp_port = int(os.getenv("WARP_SERVER_PORT", "8000"))
     warp_thread = threading.Thread(
         target=uvicorn.run,
         args=(warp_app,),
-        kwargs={"host": "0.0.0.0", "port": 8000, "log_level": "info", "access_log": True},
+        kwargs={"host": "0.0.0.0", "port": warp_port, "log_level": "info", "access_log": True},
         daemon=True
     )
     warp_thread.start()
@@ -33,6 +34,6 @@ if __name__ == "__main__":
     uvicorn.run(
         openai_server,
         host=os.getenv("HOST", "127.0.0.1"),
-        port=int(os.getenv("PORT", "8010")),
+        port=int(os.getenv("OPENAI_SERVER_PORT", "8010")),
         log_level="info",
     )

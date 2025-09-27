@@ -15,7 +15,7 @@ import socket
 
 from ..core.logging import logger
 from ..core.protobuf_utils import protobuf_to_dict
-from ..core.auth import get_valid_jwt, acquire_anonymous_access_token
+from ..core.auth import get_valid_jwt, check_and_refresh_token, mark_current_account_quota_exhausted
 from ..config.settings import WARP_URL as CONFIG_WARP_URL
 
 
@@ -84,6 +84,24 @@ async def send_protobuf_to_warp_api(
             logger.warning("TLS verification disabled via WARP_INSECURE_TLS for Warp API client")
 
         async with httpx.AsyncClient(http2=True, timeout=httpx.Timeout(60.0), verify=verify_opt, trust_env=True) as client:
+            # 在请求前检查配额，如果不足则提前刷新账户
+            try:
+                from ..core.auth import should_refresh_for_quota
+                from ..config.settings import QUOTA_REFRESH_THRESHOLD
+                quota_low = await should_refresh_for_quota(threshold=QUOTA_REFRESH_THRESHOLD)
+                if quota_low:
+                    logger.info("配额不足，提前刷新账户...")
+                    try:
+                        success = await check_and_refresh_token(force_refresh=True)
+                        if success:
+                            logger.info("账户刷新成功")
+                        else:
+                            logger.warning("账户刷新失败")
+                    except Exception as e:
+                        logger.warning(f"账户刷新失败: {e}")
+            except Exception as e:
+                logger.warning(f"配额检查异常: {e}")
+
             # 最多尝试两次：第一次失败且为配额429时申请匿名token并重试一次
             for attempt in range(2):
                 jwt = await get_valid_jwt() if attempt == 0 else jwt  # keep existing unless refreshed explicitly
@@ -101,21 +119,23 @@ async def send_protobuf_to_warp_api(
                     if response.status_code != 200:
                         error_text = await response.aread()
                         error_content = error_text.decode('utf-8') if error_text else "No error content"
-                        # 检测配额耗尽错误并在第一次失败时尝试申请匿名token
+                        # 检测配额耗尽错误并在第一次失败时尝试刷新账户
                         if response.status_code == 429 and attempt == 0 and (
                             ("No remaining quota" in error_content) or ("No AI requests remaining" in error_content)
                         ):
-                            logger.warning("WARP API 返回 429 (配额用尽)。尝试申请匿名token并重试一次…")
+                            logger.warning("WARP API 返回 429 (配额用尽)。尝试刷新账户并重试一次…")
+                            # 先标记当前账户配额用尽
+                            mark_current_account_quota_exhausted()
                             try:
-                                new_jwt = await acquire_anonymous_access_token()
-                            except Exception:
-                                new_jwt = None
-                            if new_jwt:
-                                jwt = new_jwt
-                                # 跳出当前响应并进行下一次尝试
-                                continue
-                            else:
-                                logger.error("匿名token申请失败，无法重试。")
+                                success = await check_and_refresh_token(force_refresh=True)
+                                if success:
+                                    jwt = await get_valid_jwt()
+                                    # 跳出当前响应并进行下一次尝试
+                                    continue
+                                else:
+                                    logger.error("账户刷新失败，无法重试。")
+                            except Exception as e:
+                                logger.error(f"账户刷新异常: {e}，无法重试。")
                                 logger.error(f"WARP API HTTP ERROR {response.status_code}: {error_content}")
                                 return f"❌ Warp API Error (HTTP {response.status_code}): {error_content}", None, None
                         # 其他错误或第二次失败
@@ -268,6 +288,24 @@ async def send_protobuf_to_warp_api_parsed(protobuf_bytes: bytes) -> tuple[str, 
             logger.warning("TLS verification disabled via WARP_INSECURE_TLS for Warp API client")
 
         async with httpx.AsyncClient(http2=True, timeout=httpx.Timeout(60.0), verify=verify_opt, trust_env=True) as client:
+            # 在请求前检查配额，如果不足则提前刷新账户
+            try:
+                from ..core.auth import should_refresh_for_quota
+                from ..config.settings import QUOTA_REFRESH_THRESHOLD
+                quota_low = await should_refresh_for_quota(threshold=QUOTA_REFRESH_THRESHOLD)
+                if quota_low:
+                    logger.info("配额不足，提前刷新账户...")
+                    try:
+                        success = await check_and_refresh_token(force_refresh=True)
+                        if success:
+                            logger.info("账户刷新成功")
+                        else:
+                            logger.warning("账户刷新失败")
+                    except Exception as e:
+                        logger.warning(f"账户刷新失败: {e}")
+            except Exception as e:
+                logger.warning(f"配额检查异常: {e}")
+
             # 最多尝试两次：第一次失败且为配额429时申请匿名token并重试一次
             for attempt in range(2):
                 jwt = await get_valid_jwt() if attempt == 0 else jwt  # keep existing unless refreshed explicitly
@@ -285,21 +323,23 @@ async def send_protobuf_to_warp_api_parsed(protobuf_bytes: bytes) -> tuple[str, 
                     if response.status_code != 200:
                         error_text = await response.aread()
                         error_content = error_text.decode('utf-8') if error_text else "No error content"
-                        # 检测配额耗尽错误并在第一次失败时尝试申请匿名token
+                        # 检测配额耗尽错误并在第一次失败时尝试刷新账户
                         if response.status_code == 429 and attempt == 0 and (
                             ("No remaining quota" in error_content) or ("No AI requests remaining" in error_content)
                         ):
-                            logger.warning("WARP API 返回 429 (配额用尽, 解析模式)。尝试申请匿名token并重试一次…")
+                            logger.warning("WARP API 返回 429 (配额用尽, 解析模式)。尝试刷新账户并重试一次…")
+                            # 先标记当前账户配额用尽
+                            mark_current_account_quota_exhausted()
                             try:
-                                new_jwt = await acquire_anonymous_access_token()
-                            except Exception:
-                                new_jwt = None
-                            if new_jwt:
-                                jwt = new_jwt
-                                # 跳出当前响应并进行下一次尝试
-                                continue
-                            else:
-                                logger.error("匿名token申请失败，无法重试 (解析模式)。")
+                                success = await check_and_refresh_token(force_refresh=True)
+                                if success:
+                                    jwt = await get_valid_jwt()
+                                    # 跳出当前响应并进行下一次尝试
+                                    continue
+                                else:
+                                    logger.error("账户刷新失败，无法重试 (解析模式)。")
+                            except Exception as e:
+                                logger.error(f"账户刷新异常: {e}，无法重试 (解析模式)。")
                                 logger.error(f"WARP API HTTP ERROR (解析模式) {response.status_code}: {error_content}")
                                 return f"❌ Warp API Error (HTTP {response.status_code}): {error_content}", None, None, []
                         # 其他错误或第二次失败

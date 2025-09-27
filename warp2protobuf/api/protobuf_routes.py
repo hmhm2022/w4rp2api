@@ -19,10 +19,10 @@ from pydantic import BaseModel
 
 from ..core.logging import logger
 from ..core.protobuf_utils import protobuf_to_dict, dict_to_protobuf_bytes
-from ..core.auth import get_jwt_token, refresh_jwt_if_needed, is_token_expired, get_valid_jwt, acquire_anonymous_access_token
+from ..core.auth import get_jwt_token, refresh_jwt_if_needed, is_token_expired, get_valid_jwt, should_refresh_for_quota, check_and_refresh_token
 from ..core.stream_processor import get_stream_processor, set_websocket_manager
 from ..config.models import get_all_unique_models
-from ..config.settings import CLIENT_VERSION, OS_CATEGORY, OS_NAME, OS_VERSION, WARP_URL as CONFIG_WARP_URL
+from ..config.settings import CLIENT_VERSION, OS_CATEGORY, OS_NAME, OS_VERSION, WARP_URL as CONFIG_WARP_URL, QUOTA_REFRESH_THRESHOLD
 from ..core.server_message_data import decode_server_message_data, encode_server_message_data
 
 
@@ -351,6 +351,36 @@ async def refresh_auth_token():
         raise HTTPException(500, f"刷新token失败: {e}")
 
 
+@app.get("/v1/quota/info")
+async def get_quota_info_api():
+    """获取当前账户配额信息"""
+    try:
+        from ..core.auth import get_quota_info
+        quota_info = await get_quota_info()
+        if not quota_info:
+            return {"success": False, "message": "无法获取配额信息", "suggestion": "检查ID token是否有效"}
+
+        request_limit = quota_info.get("requestLimit", 0)
+        requests_used = quota_info.get("requestsUsedSinceLastRefresh", 0)
+        remaining = request_limit - requests_used
+        next_refresh = quota_info.get("nextRefreshTime", "")
+
+        return {
+            "success": True,
+            "quota": {
+                "requestLimit": request_limit,
+                "requestsUsedSinceLastRefresh": requests_used,
+                "remaining": remaining,
+                "nextRefreshTime": next_refresh
+            },
+            "warning": remaining <= QUOTA_REFRESH_THRESHOLD if QUOTA_REFRESH_THRESHOLD > 0 else False,
+            "timestamp": datetime.now().isoformat()
+        }
+    except Exception as e:
+        logger.error(f"❌ 获取配额信息失败: {e}")
+        raise HTTPException(500, f"获取配额信息失败: {e}")
+
+
 @app.get("/api/auth/user_id")
 async def get_user_id_endpoint():
     try:
@@ -492,6 +522,19 @@ async def send_to_warp_api_stream_sse(request: EncodeRequest):
                 verify_opt = False
                 logger.warning("TLS verification disabled via WARP_INSECURE_TLS for Warp API stream endpoint")
             async with httpx.AsyncClient(http2=True, timeout=httpx.Timeout(60.0), verify=verify_opt, trust_env=True) as client:
+                # 在请求前检查配额，如果不足则提前刷新账户
+                try:
+                    quota_low = await should_refresh_for_quota(threshold=QUOTA_REFRESH_THRESHOLD)
+                    if quota_low:
+                        logger.info("配额不足，提前刷新账户...")
+                        try:
+                            await check_and_refresh_token()
+                            logger.info("匿名账户刷新成功")
+                        except Exception as e:
+                            logger.warning(f"匿名账户刷新失败: {e}")
+                except Exception as e:
+                    logger.warning(f"配额检查异常: {e}")
+
                 # 最多尝试两次：第一次失败且为配额429时申请匿名token并重试一次
                 jwt = None
                 for attempt in range(2):
@@ -511,19 +554,20 @@ async def send_to_warp_api_stream_sse(request: EncodeRequest):
                         if response.status_code != 200:
                             error_text = await response.aread()
                             error_content = error_text.decode("utf-8") if error_text else ""
-                            # 429 且包含配额信息时，申请匿名token后重试一次
+                            # 429 且包含配额信息时，刷新账户后重试一次
                             if response.status_code == 429 and attempt == 0 and (
                                 ("No remaining quota" in error_content) or ("No AI requests remaining" in error_content)
                             ):
-                                logger.warning("Warp API 返回 429 (配额用尽, SSE 代理)。尝试申请匿名token并重试一次…")
+                                logger.warning("Warp API 返回 429 (配额用尽, SSE 代理)。尝试刷新账户并重试一次…")
                                 try:
-                                    new_jwt = await acquire_anonymous_access_token()
+                                    success = await check_and_refresh_token(force_refresh=True)
+                                    if success:
+                                        # 重新获取JWT
+                                        jwt = await get_valid_jwt()
+                                        # 重试
+                                        continue
                                 except Exception:
-                                    new_jwt = None
-                                if new_jwt:
-                                    jwt = new_jwt
-                                    # 重试
-                                    continue
+                                    pass
                             logger.error(f"Warp API HTTP error {response.status_code}: {error_content[:300]}")
                             yield f"data: {{\"error\": \"HTTP {response.status_code}\"}}\n\n"
                             yield "data: [DONE]\n\n"

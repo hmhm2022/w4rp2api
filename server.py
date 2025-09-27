@@ -8,6 +8,7 @@ Warp Protobuf编解码服务器启动文件
 
 from typing import Dict, Optional, Tuple
 import base64
+import os
 from pathlib import Path
 from contextlib import asynccontextmanager
 
@@ -26,7 +27,7 @@ from warp2protobuf.core.logging import logger, set_log_file
 from warp2protobuf.api.protobuf_routes import EncodeRequest, _encode_smd_inplace
 from warp2protobuf.core.protobuf_utils import dict_to_protobuf_bytes
 from warp2protobuf.core.schema_sanitizer import sanitize_mcp_input_schema_in_packet
-from warp2protobuf.core.auth import acquire_anonymous_access_token
+
 from warp2protobuf.config.models import get_all_unique_models
 
 
@@ -514,23 +515,25 @@ async def startup_tasks():
 
     # 检查JWT token
     try:
-        from warp2protobuf.core.auth import get_jwt_token, is_token_expired
+        from warp2protobuf.core.auth import get_jwt_token, is_token_expired, check_and_refresh_token
 
         token = get_jwt_token()
         if token and not is_token_expired(token):
             logger.info("✅ JWT token有效")
-        elif not token:
-            logger.warning("⚠️ 未找到JWT token，尝试申请匿名访问token用于额度初始化…")
-            try:
-                new_token = await acquire_anonymous_access_token()
-                if new_token:
-                    logger.info("✅ 匿名访问token申请成功")
-                else:
-                    logger.warning("⚠️ 匿名访问token申请失败")
-            except Exception as e2:
-                logger.warning(f"⚠️ 匿名访问token申请异常: {e2}")
         else:
-            logger.warning("⚠️ JWT token无效或已过期，建议运行: uv run refresh_jwt.py")
+            if not token:
+                logger.warning("⚠️ 未找到JWT token，尝试刷新获取...")
+            else:
+                logger.warning("⚠️ JWT token无效或已过期，尝试刷新...")
+
+            try:
+                success = await check_and_refresh_token()
+                if success:
+                    logger.info("✅ JWT token刷新成功")
+                else:
+                    logger.warning("⚠️ JWT token刷新失败")
+            except Exception as e2:
+                logger.warning(f"⚠️ JWT token刷新异常: {e2}")
     except Exception as e:
         logger.warning(f"⚠️ JWT检查失败: {e}")
 
@@ -573,7 +576,8 @@ def main():
 
     # 启动服务器
     try:
-        uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info", access_log=True)
+        port = int(os.getenv("WARP_SERVER_PORT", "8000"))
+        uvicorn.run(app, host="0.0.0.0", port=port, log_level="info", access_log=True)
     except KeyboardInterrupt:
         logger.info("服务器被用户停止")
     except Exception as e:

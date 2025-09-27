@@ -6,9 +6,12 @@
 
 - **OpenAI API 兼容性**: 完全支持 OpenAI Chat Completions API 格式
 - **Warp 集成**: 使用 protobuf 通信与 Warp AI 服务无缝桥接
-- **双服务器架构**: 
+- **双服务器架构**:
   - 用于 Warp 通信的 Protobuf 编解码服务器
   - 用于客户端应用程序的 OpenAI 兼容 API 服务器
+- **智能账户轮换**: 多账户自动轮换，配额用尽时自动切换到下一个可用账户
+- **配额管理**: 实时配额监控和智能刷新，避免服务中断
+- **状态管理**: 自动跟踪账户状态（可用/配额用尽/刷新失败/token无效）
 - **JWT 认证**: Warp 服务的自动令牌管理和刷新
 - **流式支持**: 与 OpenAI SSE 格式兼容的实时流式响应
 - **WebSocket 监控**: 内置监控和调试功能
@@ -61,6 +64,46 @@
    python openai_compat.py
    ```
    默认地址: `http://localhost:8010`
+
+### Docker 部署
+
+使用 Docker 进行部署时，需要挂载数据卷以实现账户状态持久化：
+
+1. **创建数据目录:**
+   ```bash
+   sudo mkdir -p /opt/warp2api/data/accounts
+   sudo chown -R $USER:$USER /opt/warp2api/data
+   ```
+
+2. **运行 Docker 容器:**
+   ```bash
+   docker run -d \
+     --name warp2api \
+     -p 8000:8000 \
+     -p 8010:8010 \
+     -v /opt/warp2api/data:/app/data \
+     -e WARP_JWT=your_jwt_token_here \
+     -e WARP_REFRESH_TOKEN=your_refresh_token_here \
+     your-image-name
+   ```
+
+3. **使用 docker-compose (推荐):**
+   ```yaml
+   version: '3.8'
+   services:
+     warp2api:
+       image: your-image-name
+       ports:
+         - "8000:8000"
+         - "8010:8010"
+       volumes:
+         - /opt/warp2api/data:/app/data
+       environment:
+         - WARP_JWT=your_jwt_token_here
+         - WARP_REFRESH_TOKEN=your_refresh_token_here
+   ```
+
+**注意**: Docker 部署时账户文件会自动保存到 `/opt/warp2api/data/accounts/warp_accounts_simple.json`，确保该目录有适当的读写权限。
 
 ### 使用 API
 
@@ -137,9 +180,51 @@ for chunk in response:
 |------|------|--------|
 | `WARP_JWT` | Warp 认证 JWT 令牌 | 必需 |
 | `WARP_REFRESH_TOKEN` | JWT 刷新令牌 | 必需 |
+| `LOCAL_JWT_FILEPATH` | 多账户JSON文件路径（可选） | 未设置 |
+| `WARP_QUOTA_REFRESH_THRESHOLD` | 配额刷新阈值（0=禁用检查） | `0` |
 | `HOST` | 服务器主机地址 | `127.0.0.1` |
-| `PORT` | OpenAI API 服务器端口 | `8010` |
-| `BRIDGE_BASE_URL` | Protobuf 桥接服务器 URL | `http://localhost:8000` |
+| `WARP_SERVER_PORT` | Protobuf 桥接服务器端口 | `8000` |
+| `OPENAI_SERVER_PORT` | OpenAI API 服务器端口 | `8010` |
+| `WARP_BRIDGE_URL` | Protobuf 桥接服务器 URL | `http://localhost:8000` |
+
+### 多账户配置
+
+系统支持智能账户轮换功能，通过配置 `LOCAL_JWT_FILEPATH` 环境变量启用：
+
+1. **创建账户文件:**
+   ```bash
+   # 创建账户配置文件
+   mkdir -p tmp
+   ```
+
+2. **配置账户文件格式 (JSON):**
+   ```json
+   [
+     {
+       "email": "account1@example.com",
+       "refresh_token": "your_refresh_token_1",
+       "account_status": "available"
+     },
+     {
+       "email": "account2@example.com",
+       "refresh_token": "your_refresh_token_2",
+       "account_status": "available"
+     }
+   ]
+   ```
+
+3. **设置环境变量:**
+   ```env
+   LOCAL_JWT_FILEPATH=tmp/warp_accounts_simple.json
+   ```
+
+**账户状态说明:**
+- `available` - 账户可用
+- `quota_exhausted` - 配额已用尽
+- `refresh_failed` - 刷新失败
+- `invalid_token` - Token无效
+
+系统会自动管理账户状态，配额不足时自动切换到下一个可用账户。
 
 ### 项目脚本
 
@@ -158,8 +243,18 @@ warp-test
 服务会自动处理 Warp 认证:
 
 1. **JWT 管理**: 自动令牌验证和刷新
-2. **匿名访问**: 在需要时回退到匿名令牌
-3. **令牌持久化**: 安全的令牌存储和重用
+2. **智能账户轮换**: 配额不足时自动切换到下一个可用账户
+3. **状态跟踪**: 实时监控每个账户的配额和状态
+4. **匿名访问**: 在需要时回退到匿名令牌
+5. **令牌持久化**: 安全的令牌存储和重用
+
+### 账户轮换工作原理
+
+1. **启动检查**: 系统启动时自动初始化账户状态
+2. **配额监控**: 实时监控当前账户的配额使用情况
+3. **智能切换**: 配额不足时立即标记当前账户并切换到下一个可用账户
+4. **状态管理**: 自动更新账户状态，避免重复使用已耗尽的账户
+5. **持久化存储**: 账户状态信息持久化保存，重启后保持状态
 
 ## 🧪 开发
 

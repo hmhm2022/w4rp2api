@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 import uuid
 from typing import Any, Dict, List, Optional
@@ -53,6 +54,20 @@ def list_models():
             raise HTTPException(502, f"bridge_unreachable: {e}")
 
 
+@router.get("/v1/quota/info")
+async def get_quota_info():
+    """获取配额信息，转发到桥接服务器"""
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(f"{BRIDGE_BASE_URL}/v1/quota/info")
+            if resp.status_code != 200:
+                raise HTTPException(resp.status_code, f"bridge_error: {resp.text}")
+            return resp.json()
+    except Exception as e:
+        raise HTTPException(502, f"bridge_unreachable: {e}")
+
+
 @router.post("/v1/chat/completions")
 async def chat_completions(req: ChatCompletionsRequest):
     try:
@@ -69,6 +84,12 @@ async def chat_completions(req: ChatCompletionsRequest):
     except Exception:
         logger.info("[OpenAI Compat] 接收到的 Chat Completions 请求体(原始) 序列化失败")
 
+    # 提取原始请求中的 referenced_attachments
+    # 注意：在 OpenAI 兼容层中，referenced_attachments 不是标准字段
+    # 我们需要从实际的 Protobuf 请求中提取，这里先设为 None
+    # 实际的 referenced_attachments 处理将在后续的 Protobuf 转换中进行
+    original_referenced_attachments: Optional[Dict[str, Any]] = None
+
     # 整理消息
     history: List[ChatMessage] = reorder_messages_for_anthropic(list(req.messages))
 
@@ -81,16 +102,56 @@ async def chat_completions(req: ChatCompletionsRequest):
     except Exception:
         logger.info("[OpenAI Compat] 整理后的请求体(post-reorder) 序列化失败")
 
-    system_prompt_text: Optional[str] = None
+    # 收集 env system prompt 以及客户端传入的 system 消息文本（不修改原 history 顺序）。
     try:
-        chunks: List[str] = []
-        for _m in history:
-            if _m.role == "system":
-                _txt = segments_to_text(normalize_content_to_list(_m.content))
-                if _txt.strip():
-                    chunks.append(_txt)
-        if chunks:
-            system_prompt_text = "\n\n".join(chunks)
+        system_prompt_env = os.environ.get("SYSTEM_PROMPT")
+        system_prompt_mode = os.environ.get("SYSTEM_PROMPT_MODE", "merge").lower()
+        logger.info(f"[OpenAI Compat] 环境变量读取: SYSTEM_PROMPT_MODE={system_prompt_mode}, SYSTEM_PROMPT存在={bool(system_prompt_env)}")
+    except Exception as e:
+        system_prompt_env = None
+        system_prompt_mode = "merge"
+        logger.warning(f"[OpenAI Compat] 环境变量读取失败: {e}")
+
+    # 构造 system prompt: 根据模式决定是合并还是替换
+    system_prompt_text: Optional[str] = None
+    client_has_referenced_attachments_system_prompt = False
+
+    try:
+        # 检查客户端是否通过 referenced_attachments 发送了 SYSTEM_PROMPT
+        # 这需要检查原始请求，但由于我们在 OpenAI 兼容层，暂时无法直接获取
+        # 我们将在 attach_user_and_tools_to_inputs 中处理这个问题
+
+        if system_prompt_mode == "replace":
+            # 替换模式：只使用环境变量的 SYSTEM_PROMPT，忽略客户端的所有 system 消息和 referenced_attachments
+            if system_prompt_env and system_prompt_env.strip():
+                system_prompt_text = system_prompt_env.strip()
+                logger.info("[OpenAI Compat] 使用替换模式：忽略客户端所有 system 消息和 referenced_attachments，仅使用环境变量 SYSTEM_PROMPT")
+            else:
+                logger.info("[OpenAI Compat] 替换模式：环境变量 SYSTEM_PROMPT 为空，将不设置任何系统提示词")
+        else:
+            # 合并模式（默认）：env 在前（若存在），随后为客户端的 system 消息（保持原出现顺序），去重
+            client_system_texts: List[str] = []
+            for _m in history:
+                if _m.role == "system":
+                    try:
+                        _txt = segments_to_text(normalize_content_to_list(_m.content))
+                    except Exception:
+                        _txt = str(_m.content or "")
+                    if _txt and _txt.strip():
+                        client_system_texts.append(_txt.strip())
+            merged_parts: List[str] = []
+            seen: set[str] = set()
+            if system_prompt_env and system_prompt_env.strip():
+                env_clean = system_prompt_env.strip()
+                merged_parts.append(env_clean)
+                seen.add(env_clean)
+            for t in client_system_texts:
+                if t not in seen:
+                    merged_parts.append(t)
+                    seen.add(t)
+            if merged_parts:
+                system_prompt_text = "\n\n".join(merged_parts)
+            logger.info(f"[OpenAI Compat] 使用合并模式：环境变量+客户端 system 消息，共 {len(merged_parts)} 个部分")
     except Exception:
         system_prompt_text = None
 
@@ -112,7 +173,7 @@ async def chat_completions(req: ChatCompletionsRequest):
     if STATE.conversation_id:
         packet.setdefault("metadata", {})["conversation_id"] = STATE.conversation_id
 
-    attach_user_and_tools_to_inputs(packet, history, system_prompt_text)
+    attach_user_and_tools_to_inputs(packet, history, system_prompt_text, system_prompt_mode, original_referenced_attachments)
 
     if req.tools:
         mcp_tools: List[Dict[str, Any]] = []
@@ -126,6 +187,36 @@ async def chat_completions(req: ChatCompletionsRequest):
             })
         if mcp_tools:
             packet.setdefault("mcp_context", {}).setdefault("tools", []).extend(mcp_tools)
+
+    # 在替换模式下，需要检查并移除客户端可能通过其他方式发送的 SYSTEM_PROMPT
+    if system_prompt_mode == "replace":
+        # 这是一个后备处理，确保在替换模式下完全忽略客户端的 SYSTEM_PROMPT
+        try:
+            # 检查 packet 中是否有客户端的 referenced_attachments.SYSTEM_PROMPT
+            user_inputs = packet.get("input", {}).get("user_inputs", {}).get("inputs", [])
+            for user_input in user_inputs:
+                user_query = user_input.get("user_query", {})
+                if "referenced_attachments" in user_query:
+                    ref_attachments = user_query["referenced_attachments"]
+                    if "SYSTEM_PROMPT" in ref_attachments:
+                        # 检查是否是我们设置的环境变量 SYSTEM_PROMPT
+                        current_system_prompt = ref_attachments["SYSTEM_PROMPT"].get("plain_text", "")
+                        if system_prompt_text and current_system_prompt == system_prompt_text:
+                            # 这是我们设置的，保留
+                            logger.info("[OpenAI Compat] 替换模式：保留环境变量设置的 SYSTEM_PROMPT")
+                        else:
+                            # 这可能是客户端发送的，在替换模式下应该移除
+                            logger.info("[OpenAI Compat] 替换模式：检测到客户端 SYSTEM_PROMPT，已移除")
+                            if system_prompt_text:
+                                # 用环境变量的内容替换
+                                ref_attachments["SYSTEM_PROMPT"] = {
+                                    "plain_text": system_prompt_text
+                                }
+                            else:
+                                # 完全移除 SYSTEM_PROMPT
+                                del ref_attachments["SYSTEM_PROMPT"]
+        except Exception as e:
+            logger.warning(f"[OpenAI Compat] 替换模式后备处理失败: {e}")
 
     # 3) 打印转换成 protobuf JSON 的请求体（发送到 bridge 的数据包）
     try:
